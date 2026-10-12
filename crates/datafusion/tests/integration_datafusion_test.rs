@@ -17,7 +17,7 @@
 
 //! Integration tests for Iceberg Datafusion with Hive Metastore.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::vec;
@@ -30,18 +30,18 @@ use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSc
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::collect;
-use expect_test::expect;
+use expect_test::{Expect, expect};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema, StructType, Transform, Type, UnboundPartitionSpec,
+    Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Transform, Type,
+    UnboundPartitionField, UnboundPartitionSpec,
 };
-use iceberg::test_utils::check_record_batches;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{
     Catalog, CatalogBuilder, MemoryCatalog, NamespaceIdent, Result as IcebergResult,
@@ -56,6 +56,49 @@ use iceberg_datafusion::{
     IcebergCatalogProvider, IcebergCatalogTableProvider, IcebergStaticTableProvider,
 };
 use tempfile::TempDir;
+
+/// Snapshot assertions over record batches, optionally sorted by one column.
+fn check_record_batches(
+    record_batches: Vec<RecordBatch>,
+    expected_schema: Expect,
+    expected_data: Expect,
+    ignore_check_columns: &[&str],
+    sort_column: Option<&str>,
+) {
+    let first_batch = record_batches.first().expect("Empty record batches");
+    let mut batch = concat_batches(&first_batch.schema(), &record_batches).unwrap();
+    if let Some(sort_column) = sort_column {
+        let column = batch.column_by_name(sort_column).unwrap();
+        let indices = sort_to_indices(column, None, None).unwrap();
+        batch = take_record_batch(&batch, &indices).unwrap();
+    }
+
+    expected_schema.assert_eq(
+        &batch
+            .schema()
+            .fields()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",\n"),
+    );
+    expected_data.assert_eq(
+        &batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .map(|(field, column)| {
+                if ignore_check_columns.contains(&field.name().as_str()) {
+                    format!("{}: (skipped)", field.name())
+                } else {
+                    format!("{}: {column:?}", field.name())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",\n"),
+    );
+}
 
 fn temp_path() -> String {
     let temp_dir = TempDir::new().unwrap();
@@ -865,7 +908,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let namespace = NamespaceIdent::new("test_partitioned_write".to_string());
     set_test_namespace(&iceberg_catalog, &namespace).await?;
 
-    // Create a schema with a partition column
+    // Create a schema with string and nullable float/double partition columns
     let schema = Schema::builder()
         .with_schema_id(0)
         .with_fields(vec![
@@ -874,13 +917,45 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
                 .into(),
             NestedField::required(3, "value", Type::Primitive(PrimitiveType::String))
                 .into(),
+            NestedField::optional(
+                4,
+                "float_partition",
+                Type::Primitive(PrimitiveType::Float),
+            )
+            .into(),
+            NestedField::optional(
+                5,
+                "double_partition",
+                Type::Primitive(PrimitiveType::Double),
+            )
+            .into(),
         ])
         .build()?;
 
-    // Create partition spec with identity transform on category
+    // Identity-partition on category and both floating-point values
     let partition_spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
-        .add_partition_field(2, "category", Transform::Identity)?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![2])
+                .name("category")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![4])
+                .name("float_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
+        .add_partition_field(
+            UnboundPartitionField::builder()
+                .source_ids(vec![5])
+                .name("double_partition")
+                .transform(Transform::Identity)
+                .build()?,
+        )?
         .build();
 
     // Create the partitioned table
@@ -897,7 +972,9 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
     let client = Arc::new(iceberg_catalog);
     let catalog = Arc::new(IcebergCatalogProvider::try_new(client.clone()).await?);
 
-    let ctx = SessionContext::new();
+    // One task must return all five partition files in the same Avro payload.
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     ctx.register_catalog("catalog", catalog);
 
     // Insert data with multiple partition values in a single batch
@@ -906,11 +983,12 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
             r#"
             INSERT INTO catalog.test_partitioned_write.partitioned_table 
             VALUES 
-                (1, 'electronics', 'laptop'),
-                (2, 'electronics', 'phone'),
-                (3, 'books', 'novel'),
-                (4, 'books', 'textbook'),
-                (5, 'clothing', 'shirt')
+                (1, 'electronics', 'laptop', CAST(123.456 AS REAL), CAST(123.456 AS DOUBLE)),
+                (2, 'electronics', 'phone', CAST(123.456 AS REAL), CAST(123.456 AS DOUBLE)),
+                (3, 'books', 'novel', CAST('NaN' AS REAL), CAST('NaN' AS DOUBLE)),
+                (4, 'books', 'textbook', CAST('Infinity' AS REAL), CAST('Infinity' AS DOUBLE)),
+                (5, 'clothing', 'shirt', CAST('-Infinity' AS REAL), CAST('-Infinity' AS DOUBLE)),
+                (6, 'clothing', 'coat', CAST(NULL AS REAL), CAST(NULL AS DOUBLE))
             "#,
         )
         .await
@@ -924,9 +1002,9 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
-    assert_eq!(rows_inserted.value(0), 5);
+    assert_eq!(rows_inserted.value(0), 6);
 
-    // Query the table to verify data
+    // Read all rows without a filter, including NaN, infinities, and null.
     let df = ctx
         .sql("SELECT * FROM catalog.test_partitioned_write.partitioned_table ORDER BY id")
         .await
@@ -940,7 +1018,9 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
         expect![[r#"
             Field { "id": Int32, metadata: {"PARQUET:field_id": "1"} },
             Field { "category": Utf8, metadata: {"PARQUET:field_id": "2"} },
-            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} }"#]],
+            Field { "value": Utf8, metadata: {"PARQUET:field_id": "3"} },
+            Field { "float_partition": nullable Float32, metadata: {"PARQUET:field_id": "4"} },
+            Field { "double_partition": nullable Float64, metadata: {"PARQUET:field_id": "5"} }"#]],
         expect![[r#"
             id: PrimitiveArray<Int32>
             [
@@ -949,6 +1029,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               3,
               4,
               5,
+              6,
             ],
             category: StringArray
             [
@@ -956,6 +1037,7 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               "electronics",
               "books",
               "books",
+              "clothing",
               "clothing",
             ],
             value: StringArray
@@ -965,14 +1047,67 @@ async fn test_insert_into_partitioned() -> Result<(), Box<dyn Error>> {
               "novel",
               "textbook",
               "shirt",
+              "coat",
+            ],
+            float_partition: PrimitiveArray<Float32>
+            [
+              123.456,
+              123.456,
+              NaN,
+              inf,
+              -inf,
+              null,
+            ],
+            double_partition: PrimitiveArray<Float64>
+            [
+              123.456,
+              123.456,
+              NaN,
+              inf,
+              -inf,
+              null,
             ]"#]],
         &[],
         Some("id"),
     );
 
-    // Verify that data files exist under correct partition paths
+    // Verify the committed files, rows, and partition values.
     let table_ident = TableIdent::new(namespace.clone(), "partitioned_table".to_string());
     let table = client.load_table(&table_ident).await?;
+
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let mut file_count = 0;
+    let mut row_count = 0;
+    let mut partitions = HashSet::new();
+    for entry in manifest_list.entries() {
+        let manifest = table.manifest_reader().read(entry).await?;
+        for entry in manifest.entries() {
+            file_count += 1;
+            row_count += entry.data_file().record_count();
+            partitions.insert(entry.data_file().partition().clone());
+        }
+    }
+    assert_eq!(file_count, 5);
+    assert_eq!(row_count, 6);
+    let partition = |category: &str, float: Option<f32>, double: Option<f64>| {
+        Struct::from_iter([
+            Some(Literal::string(category)),
+            float.map(Literal::float),
+            double.map(Literal::double),
+        ])
+    };
+    assert_eq!(
+        partitions,
+        HashSet::from([
+            partition("electronics", Some(123.456), Some(123.456)),
+            partition("books", Some(f32::NAN), Some(f64::NAN)),
+            partition("books", Some(f32::INFINITY), Some(f64::INFINITY)),
+            partition("clothing", Some(f32::NEG_INFINITY), Some(f64::NEG_INFINITY)),
+            partition("clothing", None, None),
+        ])
+    );
+
     let table_location = table.metadata().location();
     let file_io = table.file_io();
 
