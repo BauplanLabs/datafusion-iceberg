@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,13 +33,19 @@ use iceberg::io::{
     FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage, OutputFile, Storage,
     StorageConfig, StorageFactory,
 };
-use iceberg::{Error, ErrorKind, Result as IcebergResult};
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+use iceberg::{
+    Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, Result as IcebergResult,
+    TableIdent,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::IcebergTableProviderFactory;
+use crate::{IcebergCatalogProvider, IcebergTableProviderFactory};
 
 pub const FIXTURE_URI: &str = "s3://iceberg-test/warehouse/taxi";
 const WAREHOUSE_URI: &str = "s3://iceberg-test/warehouse/";
+const CATALOG_NAME: &str = "datafusion";
+const NAMESPACE_NAME: &str = "public";
 
 pub struct IcebergTestHarness {
     ctx: SessionContext,
@@ -50,6 +57,8 @@ impl IcebergTestHarness {
             .with_default_features()
             // Plan snapshots must not vary with the runner's CPU count.
             .with_config(SessionConfig::new().with_target_partitions(16))
+            // We register a factory in addition to the catalog below
+            // so that tests can be written against the factory's behaviours
             .with_table_factory(
                 "ICEBERG".to_string(),
                 Arc::new(IcebergTableProviderFactory::new_with_storage_factory(
@@ -57,14 +66,36 @@ impl IcebergTestHarness {
                 )),
             )
             .build();
+
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(FixtureStorageFactory::default()))
+            .load(
+                CATALOG_NAME,
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    WAREHOUSE_URI.to_string(),
+                )]),
+            )
+            .await
+            .map_err(crate::to_datafusion_error)?;
+
+        let namespace = NamespaceIdent::new(String::from(NAMESPACE_NAME));
+        catalog
+            .create_namespace(&namespace, HashMap::from([]))
+            .await
+            .map_err(crate::to_datafusion_error)?;
+
+        let table = TableIdent::new(namespace, String::from("taxi"));
+        catalog
+            .register_table(&table, format!("{FIXTURE_URI}/metadata/v1.metadata.json"))
+            .await
+            .map_err(crate::to_datafusion_error)?;
+
+        let provider = IcebergCatalogProvider::try_new(Arc::new(catalog)).await?;
+
         let ctx = SessionContext::new_with_state(state);
-        ctx.sql(&format!(
-            "CREATE EXTERNAL TABLE taxi STORED AS ICEBERG \
-         LOCATION '{FIXTURE_URI}/metadata/v1.metadata.json'"
-        ))
-        .await?
-        .collect()
-        .await?;
+        ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
+
         Ok(Self { ctx })
     }
 
