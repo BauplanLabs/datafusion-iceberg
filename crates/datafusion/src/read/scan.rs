@@ -182,13 +182,19 @@ impl DataSource for IcebergDataSource {
     fn open(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let fut = get_batch_stream(
             self.table.clone(),
             self.snapshot_id,
             Some(self.projection.clone()),
             self.predicate.clone(),
+            context
+                .session_config()
+                .options()
+                .execution
+                .parquet
+                .enable_page_index,
         );
         let stream = futures::stream::once(fut).try_flatten();
 
@@ -274,6 +280,7 @@ async fn get_batch_stream(
     snapshot_id: Option<i64>,
     column_names: Option<Vec<String>>,
     predicate: Option<Predicate>,
+    enable_page_index: bool,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
@@ -287,7 +294,10 @@ async fn get_batch_stream(
     if let Some(predicate) = predicate {
         scan_builder = scan_builder.with_filter(predicate);
     }
-    let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
+    let table_scan = scan_builder
+        .with_row_selection_enabled(enable_page_index)
+        .build()
+        .map_err(to_datafusion_error)?;
 
     let stream = table_scan
         .to_arrow()
